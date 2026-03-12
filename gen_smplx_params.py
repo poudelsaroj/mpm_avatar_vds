@@ -14,11 +14,10 @@ import glob
 
 PRETRAINED   = "/teamspace/studios/this_studio/pretrained_models"
 TRACKING_DIR = f"{PRETRAINED}/output/tracking/a1_s1_460_200"
-SPLIT_IDX    = "/teamspace/studios/this_studio/mpm_avatar_vds/data/a1_s1/split_idx.npz"
 OUT_DIR      = f"{TRACKING_DIR}/a1_s1/smplx_fitted"
 
-split     = np.load(SPLIT_IDX, allow_pickle=True)
-human_idx = split["reordered_human_v_idx"]
+# split_idx.npz not required — use centroid of all vertices as translation estimate
+human_idx = None
 
 params_files = sorted(glob.glob(f"{TRACKING_DIR}/params_*.npz"))
 print(f"Generating smplx params for {len(params_files)} frames...")
@@ -28,9 +27,8 @@ for pf in params_files:
     data  = np.load(pf)
     verts = data["vertices"]           # [N_verts, 3]
 
-    # Estimate translation from body vertex centroid
-    body_verts = verts[human_idx]      # [N_body, 3]
-    trans      = body_verts.mean(0)    # [3]
+    # Estimate translation from centroid of all vertices
+    trans = verts.mean(0)   # [3]
 
     # Save as numpy arrays — train_material_params.py line 288 does torch.from_numpy(v)
     param = {
