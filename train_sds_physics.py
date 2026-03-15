@@ -120,6 +120,7 @@ class SDSPhysicsTrainer(Trainer):
         sds_cfg: dict,
         wan_ckpt_dir: str,
         wan_repo_root: Optional[str],
+        resume_ckpt: Optional[str] = None,
     ):
         # ── Parent setup (loads Gaussians, SMPLX, MPM, Adam optimizer) ──────
         print("\n[SDS] Loading base Trainer (Gaussians + SMPLX + MPM) …")
@@ -237,18 +238,47 @@ class SDSPhysicsTrainer(Trainer):
         )   # [3, H, W] in [0, 1]
         print(f"[SDS] Conditioning image shape: {self.cond_image.shape}")
 
+        # ── Full checkpoint resume ────────────────────────────────────────────
+        # Restores: params, friction, optimizer state, scheduler state, step.
+        # Must happen after super().__init__() (creates optimizer/scheduler)
+        # and after Wan is loaded (nothing else to initialise).
+        if resume_ckpt and os.path.exists(resume_ckpt):
+            print(f"[SDS] Resuming full checkpoint from {resume_ckpt} …")
+            ckpt = torch.load(resume_ckpt, map_location="cpu")
+            self.torch_param["D"].data.fill_(float(ckpt["D"]))
+            self.torch_param["E"].data.fill_(float(ckpt["E"]))
+            self.torch_param["H"].data.fill_(float(ckpt["H"]))
+            self.friction_val = float(ckpt["friction"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.scheduler.load_state_dict(ckpt["scheduler"])
+            self.step        = int(ckpt["step"])
+            self.best_params = ckpt["best_params"]
+            print(
+                f"[SDS] Resumed at step {self.step}  "
+                f"D={self.torch_param['D'].item():.4f}  "
+                f"E={self.torch_param['E'].item()*100:.1f}Pa  "
+                f"H={self.torch_param['H'].item():.4f}  "
+                f"friction={self.friction_val:.4f}  "
+                f"best_loss={self.best_params.get('loss', float('inf')):.6f}"
+            )
+        elif resume_ckpt:
+            print(f"[SDS] Warning: resume_ckpt not found: {resume_ckpt} — starting fresh")
+
         # ── Param-trajectory CSV (main process only) ─────────────────────────
         if self.accelerator.is_main_process:
             csv_path = os.path.join(self.output_path, "param_trajectory.csv")
-            self._csv_file = open(csv_path, "w", newline="")
+            # Append mode when resuming so we don't lose previous steps
+            csv_mode = "a" if (resume_ckpt and os.path.exists(resume_ckpt)) else "w"
+            self._csv_file = open(csv_path, csv_mode, newline="")
             self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow([
-                "step", "D", "E_Pa", "H", "friction",
-                "sds_loss_base",
-                "sds_loss_dD", "sds_loss_dE", "sds_loss_dH", "sds_loss_dfriction",
-                "grad_D", "grad_E", "grad_H", "grad_friction",
-                "camera_idx",
-            ])
+            if csv_mode == "w":
+                self._csv_writer.writerow([
+                    "step", "D", "E_Pa", "H", "friction",
+                    "sds_loss_base",
+                    "sds_loss_dD", "sds_loss_dE", "sds_loss_dH", "sds_loss_dfriction",
+                    "grad_D", "grad_E", "grad_H", "grad_friction",
+                    "camera_idx",
+                ])
         else:
             self._csv_file   = None
             self._csv_writer = None
@@ -789,11 +819,25 @@ class SDSPhysicsTrainer(Trainer):
 
     def save(self) -> None:
         super().save()
-        # Persist best params as .npz
+        # Persist best params as .npz (legacy format)
         np.savez(
             os.path.join(self.output_path, f"sds_best_param_{self.step:05d}.npz"),
             **{k: v for k, v in self.best_params.items()},
         )
+        # Full resume checkpoint — params + optimizer + scheduler + step
+        resume_data = {
+            "step":        self.step,
+            "D":           self.torch_param["D"].item(),
+            "E":           self.torch_param["E"].item(),
+            "H":           self.torch_param["H"].item(),
+            "friction":    self.friction_val,
+            "optimizer":   self.optimizer.state_dict(),
+            "scheduler":   self.scheduler.state_dict(),
+            "best_params": self.best_params,
+        }
+        torch.save(resume_data, os.path.join(self.output_path, f"resume_ckpt_{self.step:05d}.pt"))
+        torch.save(resume_data, os.path.join(self.output_path, "resume_latest.pt"))
+        print(f"[SDS] Resume checkpoint saved (step {self.step})")
         # Save rendered PNG frames from a few cameras for visual inspection
         ckpt_dir = os.path.join(self.output_path, f"checkpoint_{self.step:05d}")
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -843,8 +887,13 @@ def parse_args():
         default="bridge_sds/configs/sds_test.yaml",
         help="SDS YAML config path.",
     )
-    parser.add_argument("--min_friction", type=float, default=None)
-    parser.add_argument("--max_friction", type=float, default=None)
+    parser.add_argument("--min_friction",  type=float, default=None)
+    parser.add_argument("--max_friction",  type=float, default=None)
+    parser.add_argument(
+        "--resume_ckpt", type=str, default=None,
+        help="Path to resume_latest.pt or resume_ckpt_NNNNN.pt — restores "
+             "params, optimizer, scheduler, and step counter exactly.",
+    )
     parser.add_argument("--run_eval",    action="store_true", default=False)
     parser.add_argument("--skip_sim",    action="store_true", default=False)
     parser.add_argument("--skip_render", action="store_true", default=False)
@@ -860,7 +909,7 @@ def parse_args():
         lp.extract(raw), op.extract(raw), pp.extract(raw),
         raw.run_eval, raw.skip_sim, raw.skip_render, raw.skip_video,
         raw.wan_ckpt_dir, raw.wan_repo_root, raw.sds_cfg,
-        raw.min_friction, raw.max_friction,
+        raw.min_friction, raw.max_friction, raw.resume_ckpt,
     )
 
 
@@ -873,7 +922,7 @@ if __name__ == "__main__":
         args, opt, pipe,
         run_eval, skip_sim, skip_render, skip_video,
         wan_ckpt_dir, wan_repo_root, sds_cfg_path,
-        min_friction, max_friction,
+        min_friction, max_friction, resume_ckpt,
     ) = parse_args()
 
     sds_cfg = _load_sds_cfg(sds_cfg_path)
@@ -923,6 +972,7 @@ if __name__ == "__main__":
         sds_cfg=sds_cfg,
         wan_ckpt_dir=wan_ckpt_dir,
         wan_repo_root=wan_repo_root,
+        resume_ckpt=resume_ckpt,
     )
 
     if run_eval:
