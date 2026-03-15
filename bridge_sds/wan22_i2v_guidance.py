@@ -319,7 +319,10 @@ class Wan22I2VGuidance(nn.Module):
 
         # ── 3. Rectified-flow noising ─────────────────────────────────────────
         #   x_t = (1 − σ) x₀ + σ ε,    σ = t / T ∈ [0, 1]
-        noise = torch.randn_like(x0, generator=generator)
+        if generator is not None:
+            noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
+        else:
+            noise = torch.randn_like(x0)
         sigma = (timesteps.float() / float(self.num_train_timesteps))
         # Reshape for broadcasting: (B,) → (B, 1, 1, 1, 1)
         sigma = sigma.view(b, 1, 1, 1, 1)
