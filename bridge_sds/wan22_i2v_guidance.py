@@ -88,10 +88,13 @@ class Wan22I2VGuidance(nn.Module):
         self._dtype = torch.bfloat16
 
         try:
-            from diffusers import WanPipeline, AutoencoderKLWan  # type: ignore
+            from diffusers import AutoencoderKLWan  # type: ignore
+            from diffusers.models import WanTransformer3DModel  # type: ignore
+            from diffusers.schedulers import UniPCMultistepScheduler  # type: ignore
+            from transformers import AutoTokenizer, UMT5EncoderModel  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
-                "diffusers is required for Wan 5B guidance.\n"
+                "diffusers and transformers are required for Wan 5B guidance.\n"
                 "Install: pip install git+https://github.com/huggingface/diffusers\n"
                 f"Error: {exc}"
             ) from exc
@@ -99,42 +102,51 @@ class Wan22I2VGuidance(nn.Module):
         model_path = str(config.ckpt_dir)
         print(f"[Wan5B] Loading from {model_path} …")
 
-        # VAE in float32 for better encoding quality
-        vae = AutoencoderKLWan.from_pretrained(
-            model_path, subfolder="vae", torch_dtype=torch.float32
-        )
-        # Full pipeline in bfloat16
-        pipe = WanPipeline.from_pretrained(
-            model_path, vae=vae, torch_dtype=self._dtype
-        )
-        pipe = pipe.to(self.device)
-        if hasattr(pipe, "set_progress_bar_config"):
-            pipe.set_progress_bar_config(disable=True)
+        # ── Load transformer directly to GPU (bfloat16, ~10 GB) ──────────────
+        print("[Wan5B]   loading transformer …")
+        self.transformer: nn.Module = WanTransformer3DModel.from_pretrained(
+            model_path, subfolder="transformer", torch_dtype=self._dtype
+        ).to(self.device).eval().requires_grad_(False)
 
-        # Extract components and freeze
-        self.vae: nn.Module          = pipe.vae.eval().requires_grad_(False)
-        self.transformer: nn.Module  = pipe.transformer.eval().requires_grad_(False)
-        self.text_encoder: nn.Module = pipe.text_encoder.eval().requires_grad_(False)
-        self.tokenizer               = pipe.tokenizer
-        self.scheduler               = pipe.scheduler
+        # ── Load VAE directly to GPU (float32, ~1.5 GB) ───────────────────────
+        print("[Wan5B]   loading vae …")
+        self.vae: nn.Module = AutoencoderKLWan.from_pretrained(
+            model_path, subfolder="vae", torch_dtype=torch.float32
+        ).to(self.device).eval().requires_grad_(False)
+
+        # ── Scheduler (no GPU memory) ─────────────────────────────────────────
+        self.scheduler = UniPCMultistepScheduler.from_pretrained(
+            model_path, subfolder="scheduler"
+        )
 
         # Cache scaling_factor — defaults to the Wan value 0.13235
         self._scaling_factor: float = float(
             getattr(getattr(self.vae, "config", None), "scaling_factor", None) or 0.13235
         )
 
-        # Pre-encode text prompts (constant across training)
+        # ── Text encoder: load to CPU, move to GPU briefly, then delete ───────
+        # T5 is ~9.4 GB.  Loading it after transformer+VAE are already on GPU
+        # would peak at ~21 GB — just within the L4's 22.3 GB limit.
+        print("[Wan5B]   loading text_encoder (CPU) …")
+        tokenizer    = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+        text_encoder = UMT5EncoderModel.from_pretrained(
+            model_path, subfolder="text_encoder", torch_dtype=self._dtype
+        )  # starts on CPU
+
+        # Move T5 to GPU only for encoding, then immediately delete
+        print("[Wan5B]   encoding prompts (T5 on GPU briefly) …")
+        self.tokenizer    = tokenizer
+        self.text_encoder = text_encoder.to(self.device).eval().requires_grad_(False)
+
         with torch.no_grad():
             self._context      = self._encode_text(config.prompt)
             self._context_null = self._encode_text(config.negative_prompt or "")
 
-        del pipe  # pipeline shell no longer needed; components stored in self.*
-
-        # Free T5 encoder + tokenizer from GPU after pre-encoding.
-        # They are only needed once (prompt is static across the whole run).
-        # This reclaims ~9 GB on L4/A100, leaving only transformer + VAE on GPU.
+        # Free T5 + tokenizer — reclaims ~9.4 GB, leaving only transformer + VAE
         del self.text_encoder
         del self.tokenizer
+        del text_encoder
+        del tokenizer
         torch.cuda.empty_cache()
 
         vram_gb = torch.cuda.memory_allocated() / 1e9
