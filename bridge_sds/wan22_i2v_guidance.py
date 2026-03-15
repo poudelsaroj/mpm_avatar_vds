@@ -67,12 +67,13 @@ class Wan22I2VGuidance(nn.Module):
 
     All components live on device at all times — no CPU offloading.
 
-    Components:
-      - self.vae         : AutoencoderKLWan (float32)
-      - self.transformer : WanTransformer3DModel (bfloat16, frozen)
-      - self.text_encoder: T5EncoderModel / umt5-xxl (bfloat16, frozen)
-      - self.tokenizer   : T5Tokenizer (max_length=512)
-      - self.scheduler   : UniPCMultistepScheduler (flow_prediction)
+    GPU memory layout (after __init__):
+      - self.vae         : AutoencoderKLWan (float32)        ~1.5 GB
+      - self.transformer : WanTransformer3DModel (bfloat16)  ~10  GB
+      - self.scheduler   : UniPCMultistepScheduler (tiny)
+      - self._context    : pre-encoded text embedding        ~negligible
+      NOTE: text_encoder (~9.4 GB) and tokenizer are deleted after prompt
+      pre-encoding to free GPU memory. Total on-device: ~13 GB → fits on L4.
 
     Public API:
       guidance.compute_loss(video_01, cond_image_01=None, timesteps=None, generator=None)
@@ -128,9 +129,19 @@ class Wan22I2VGuidance(nn.Module):
             self._context_null = self._encode_text(config.negative_prompt or "")
 
         del pipe  # pipeline shell no longer needed; components stored in self.*
+
+        # Free T5 encoder + tokenizer from GPU after pre-encoding.
+        # They are only needed once (prompt is static across the whole run).
+        # This reclaims ~9 GB on L4/A100, leaving only transformer + VAE on GPU.
+        del self.text_encoder
+        del self.tokenizer
+        torch.cuda.empty_cache()
+
+        vram_gb = torch.cuda.memory_allocated() / 1e9
         print(
             f"[Wan5B] Ready — transformer=bfloat16, vae=float32, "
-            f"scaling_factor={self._scaling_factor}, device={self.device}"
+            f"scaling_factor={self._scaling_factor}, device={self.device}, "
+            f"VRAM after load={vram_gb:.1f} GB"
         )
 
     # ── Properties ────────────────────────────────────────────────────────────
