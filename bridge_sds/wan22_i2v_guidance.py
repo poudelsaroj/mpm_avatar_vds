@@ -131,8 +131,8 @@ class Wan22I2VGuidance(nn.Module):
         print("[Wan5B]   loading text_encoder on CPU …")
         tokenizer    = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=torch.float32
-        ).eval().requires_grad_(False)  # stays on CPU
+            model_path, subfolder="text_encoder", torch_dtype=torch.bfloat16
+        ).eval().requires_grad_(False)  # stays on CPU — bfloat16 halves RAM (~4.7 GB vs 9.4 GB)
 
         print("[Wan5B]   encoding prompts on CPU …")
         self.tokenizer    = tokenizer
