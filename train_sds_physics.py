@@ -139,6 +139,26 @@ class SDSPhysicsTrainer(Trainer):
         print(f"[SDS] Initial friction = {self.friction_val:.3f}  "
               f"range [{self.friction_min}, {self.friction_max}]")
 
+        # ── Random initialisation of H and friction ──────────────────────────
+        # D and E are randomised by the parent Trainer when --random_init_params
+        # is passed.  Here we randomise H and friction so the full φ vector
+        # starts from a uniformly random point in the search space.
+        if sds_cfg.get("random_init", False):
+            H_cfg = sds_cfg.get("phi", {}).get("H", {})
+            H_rnd = float(np.random.uniform(
+                float(H_cfg.get("min", 0.8)),
+                float(H_cfg.get("max", 1.2)),
+            ))
+            self.torch_param["H"].data.fill_(H_rnd)
+            f_rnd = float(np.random.uniform(self.friction_min, self.friction_max))
+            self.friction_val = f_rnd
+            print(
+                f"[SDS] Random init φ: "
+                f"D={self.torch_param['D'].item():.4f}  "
+                f"E={self.torch_param['E'].item()*100:.1f}Pa  "
+                f"H={H_rnd:.4f}  friction={f_rnd:.4f}"
+            )
+
         # ── Freeze shadow_net + set to eval mode ─────────────────────────────
         # Default PyTorch state is .train().  BatchNorm in training mode uses
         # batch statistics, which is wrong for single-image [1,H,W] inference.
@@ -155,13 +175,36 @@ class SDSPhysicsTrainer(Trainer):
               f"(mean over {self.gaussians.ao_maps.shape[0]} frames)")
 
         # ── Build (camera, camera_idx) list for random multi-view sampling ────
-        # test_camera_index maps position → actual dataset camera id
-        # cam_m / cam_c are indexed by actual camera id
+        # Start with test cameras (test_camera_index = list of actual cam ids)
         self._cameras: List[Tuple] = list(zip(
             self.scene.test_dataset.camera_list,
             self.scene.test_camera_index,
         ))
-        print(f"[SDS] {len(self._cameras)} cameras available for random sampling")
+        # Expand pool with train cameras for diverse SDS signal.
+        # Train dataset holds ALL cameras in order → position i == actual cam id i,
+        # which matches the indexing of gaussians.cam_m / cam_c.
+        train_cam_list = self.scene.train_dataset.camera_list
+        n_train = len(train_cam_list)
+        max_extra = int(sds_cfg.get("training", {}).get("max_extra_cameras", 16))
+        if n_train <= max_extra:
+            extra_cam_ids = list(range(n_train))
+        else:
+            extra_cam_ids = [
+                round(i * (n_train - 1) / (max_extra - 1))
+                for i in range(max_extra)
+            ]
+        existing_idxs = {cidx for _, cidx in self._cameras}
+        extra_cameras = [
+            (train_cam_list[i], i)
+            for i in extra_cam_ids
+            if i not in existing_idxs
+        ]
+        self._cameras = self._cameras + extra_cameras
+        print(
+            f"[SDS] Camera pool: {len(self._cameras)} total "
+            f"({len(self._cameras) - len(extra_cameras)} test "
+            f"+ {len(extra_cameras)} train)"
+        )
 
         # ── Load Wan 5B guidance (frozen) ────────────────────────────────────
         print(f"\n[SDS] Loading Wan 5B from {wan_ckpt_dir} …")
@@ -169,15 +212,17 @@ class SDSPhysicsTrainer(Trainer):
         if not ckpt_dir.exists():
             raise FileNotFoundError(f"Wan checkpoint dir not found: {ckpt_dir}")
 
+        sds_prompt = str(sds_cfg.get("sds", {}).get("prompt", ""))
         wan_cfg = Wan22I2VConfig(
             wan_repo_root=Path(wan_repo_root) if wan_repo_root else None,
             ckpt_dir=ckpt_dir,
             device="cuda",
             dtype=torch.float16,
-            prompt="",
+            prompt=sds_prompt,
             negative_prompt="",
             use_cfg=False,
         )
+        print(f"[SDS] Wan prompt: '{sds_prompt}'")
         self.wan_guidance = Wan22I2VGuidance(wan_cfg)
         self.wan_guidance.eval()
         print("[SDS] Wan 5B loaded and frozen.")
@@ -480,12 +525,25 @@ class SDSPhysicsTrainer(Trainer):
         H        = self.torch_param["H"].item()
         friction = self.friction_val
 
-        # ── SPSA perturbation sizes ───────────────────────────────────────
+        # ── SPSA perturbation sizes (with optional cosine annealing) ─────
         spsa = self.sds_cfg.get("spsa", {})
         dD  = float(spsa.get("dD",        0.05))
         dE  = float(spsa.get("dE",        0.05))
         dH  = float(spsa.get("dH",        0.005))
         df  = float(spsa.get("dfriction", 0.02))
+
+        # Cosine annealing: shrink perturbations as training converges.
+        # factor: 1.0 at step=0 → cosine_min_factor at step=iterations-1
+        if spsa.get("cosine_decay", False):
+            progress = self.step / max(1, self.iterations - 1)
+            min_fac  = float(spsa.get("cosine_min_factor", 0.1))
+            cosine_factor = min_fac + (1.0 - min_fac) * 0.5 * (1.0 + np.cos(np.pi * progress))
+            dD *= cosine_factor
+            dE *= cosine_factor
+            dH *= cosine_factor
+            df *= cosine_factor
+        else:
+            cosine_factor = 1.0
 
         # One-sided perturbations: base + one param nudged at a time
         perturbations = [
@@ -649,6 +707,19 @@ class SDSPhysicsTrainer(Trainer):
                 "gradients/E":             grad_E,
                 "gradients/H":             grad_H,
                 "gradients/friction":      grad_friction,
+                # SPSA perturbation sizes (after cosine decay)
+                "spsa/dD":                 dD,
+                "spsa/dE":                 dE,
+                "spsa/dH":                 dH,
+                "spsa/dfriction":          df,
+                "spsa/cosine_factor":      cosine_factor,
+                # Best params so far
+                "best/D":                  float(self.best_params.get("D",        D_new)),
+                "best/E_Pa":               float(self.best_params.get("E",        E_new * 100)),
+                "best/H":                  float(self.best_params.get("H",        H_new)),
+                "best/friction":           float(self.best_params.get("friction", f_new)),
+                "best/sds_loss":           float(self.best_params.get("loss",     base_loss)),
+                "best/step":               int(  self.best_params.get("step",     self.step)),
                 # Timing
                 "timing/step_total_s":     step_dt,
                 "timing/sim_avg_s":        float(np.mean(sim_times)),
@@ -659,9 +730,10 @@ class SDSPhysicsTrainer(Trainer):
                 "lr/H":                    self.optimizer.param_groups[2]["lr"],
                 # Camera used this step
                 "info/camera_idx":         camera_idx,
+                "info/n_cameras":          len(self._cameras),
             }
 
-            # Log rendered GIF every N steps
+            # Log rendered GIF + multi-camera snapshots every N steps
             video_every = int(
                 self.sds_cfg.get("training", {}).get("video_every", 5)
             )
@@ -670,6 +742,21 @@ class SDSPhysicsTrainer(Trainer):
                 v = base_video[0].permute(1, 0, 2, 3)
                 v_np = (v.clamp(0, 1).numpy() * 255).astype(np.uint8)
                 wd["video/sim_cloth"] = wandb.Video(v_np, fps=25, format="gif")
+
+                # Multi-camera snapshots: uniformly spaced across pool
+                n_preview = min(4, len(self._cameras))
+                preview_cams = [
+                    self._cameras[round(i * (len(self._cameras) - 1) / max(1, n_preview - 1))]
+                    for i in range(n_preview)
+                ]
+                for pcam, pcam_idx in preview_cams:
+                    frame = self._render_frame(
+                        verts=self.train_frame_verts[0],
+                        camera=pcam,
+                        camera_idx=pcam_idx,
+                    )
+                    img_np = (frame.clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    wd[f"frames/cam_{pcam_idx:03d}"] = wandb.Image(img_np)
 
             wandb.log(wd, step=self.step)
 
@@ -700,10 +787,32 @@ class SDSPhysicsTrainer(Trainer):
 
     def save(self) -> None:
         super().save()
+        # Persist best params as .npz
         np.savez(
             os.path.join(self.output_path, f"sds_best_param_{self.step:05d}.npz"),
             **{k: v for k, v in self.best_params.items()},
         )
+        # Save rendered PNG frames from a few cameras for visual inspection
+        ckpt_dir = os.path.join(self.output_path, f"checkpoint_{self.step:05d}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        n_save = min(4, len(self._cameras))
+        save_cams = [
+            self._cameras[round(i * (len(self._cameras) - 1) / max(1, n_save - 1))]
+            for i in range(n_save)
+        ]
+        try:
+            from PIL import Image as _PILImg
+            for cam, cidx in save_cams:
+                frame = self._render_frame(
+                    verts=self.train_frame_verts[0],
+                    camera=cam,
+                    camera_idx=cidx,
+                )
+                img_np = (frame.clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                _PILImg.fromarray(img_np).save(os.path.join(ckpt_dir, f"cam_{cidx:03d}.png"))
+            print(f"[SDS] Checkpoint frames saved → {ckpt_dir}")
+        except Exception as _e:
+            print(f"[SDS] Frame save skipped ({_e})")
 
 
 # ---------------------------------------------------------------------------

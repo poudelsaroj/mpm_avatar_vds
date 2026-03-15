@@ -58,6 +58,7 @@ sds:
   timestep_min:  50
   timestep_max:  950
   use_amp: true                 # fp16 autocast for Wan inference
+  prompt: "a person wearing flowing cloth, realistic cloth dynamics, natural fabric motion"
 
 # ── Loss weights ──────────────────────────────────────────────────────────────
 loss:
@@ -70,6 +71,8 @@ spsa:
   dE:        0.05
   dH:        0.005
   dfriction: 0.02
+  cosine_decay:      true       # anneal perturbation sizes over training
+  cosine_min_factor: 0.1        # minimum scale at end of training (10% of original)
 
 # ── Per-parameter learning rates ──────────────────────────────────────────────
 lr:
@@ -78,12 +81,16 @@ lr:
   H:        0.01
   friction: 0.01               # simple gradient descent (not Adam)
 
+# ── Random initialisation (hypothesis: does SDS recover plausible params?) ────
+random_init: true              # randomise H and friction (D+E via --random_init_params)
+
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  n_iterations:  100
-  log_every:     1             # log every single step (research mode)
-  save_every:    10
-  video_every:   5             # render+log gif every N steps
+  n_iterations:    1000
+  log_every:       1           # log every single step (research mode)
+  save_every:      100
+  video_every:     50          # render+log gif every N steps
+  max_extra_cameras: 16        # train cameras added to pool (uniformly sampled)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
