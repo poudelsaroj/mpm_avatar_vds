@@ -40,8 +40,7 @@ Usage
     --actor 1 --sequence 1 \\
     --train_frame_start_num 460 10 \\
     --verts_start_idx 460 \\
-    --wan_ckpt_dir  /path/to/wan_checkpoints \\
-    --wan_repo_root /path/to/wan_repo \\
+    --wan_ckpt_dir  /path/to/wan_5b_model \\
     --sds_cfg bridge_sds/configs/sds_test.yaml \\
     --iterations 100 \\
     --use_wandb --wandb_project MPMAvatar_SDS
@@ -74,7 +73,8 @@ try:
 except ImportError as _wan_err:
     raise ImportError(
         "Failed to import Wan22I2VGuidance. "
-        "Ensure bridge_sds/ is present and Wan2.2 repo is installed.\n"
+        "Ensure bridge_sds/ is present and diffusers is installed "
+        "(pip install git+https://github.com/huggingface/diffusers).\n"
         f"Original error: {_wan_err}"
     ) from _wan_err
 
@@ -720,12 +720,12 @@ def parse_args():
 
     parser.add_argument(
         "--wan_ckpt_dir", type=str, required=True,
-        help="Wan 5B checkpoint dir (needs low_noise_model/, high_noise_model/, "
-             "Wan2.1_VAE.pth, T5 checkpoint).",
+        help="Local path to snapshot_download of Wan-AI/Wan2.2-TI2V-5B-Diffusers "
+             "(diffusers layout: transformer/, vae/, text_encoder/, tokenizer/, model_index.json).",
     )
     parser.add_argument(
         "--wan_repo_root", type=str, default=None,
-        help="Path to Wan2.2 source repo (added to sys.path if given).",
+        help="[UNUSED] Legacy arg kept for backwards compat. No custom repo needed with diffusers.",
     )
     parser.add_argument(
         "--sds_cfg", type=str,

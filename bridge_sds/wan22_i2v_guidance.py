@@ -1,34 +1,31 @@
 """
-Wan2.2 Image-to-Video guidance wrapper for DreamCloth Phase3.
+Wan2.2 TI2V-5B guidance via HuggingFace diffusers.
 
-DreamCloth Phase3 needs a frozen "diffusion prior" that produces a training loss
-whose gradients can flow to MPMParameters through a differentiable video path.
+Uses WanPipeline (Wan-AI/Wan2.2-TI2V-5B-Diffusers) loaded from a local
+snapshot_download directory.  No CPU offloading.  bfloat16 throughout.
 
-The official Wan2.2 I2V model is a *flow-prediction* diffusion model operating in
-VAE latent space and conditioned on:
-  - text embeddings (T5)
-  - an image-derived conditional latent (first-frame conditioning + mask)
+Architecture (Wan2.2 TI2V-5B):
+  - WanTransformer3DModel  — flow-prediction denoiser (bfloat16, frozen)
+  - AutoencoderKLWan       — 4D VAE, spatial ×8 + temporal ×4 compression (float32)
+  - T5EncoderModel         — umt5-xxl text encoder, 4096-dim embeddings (bfloat16, frozen)
+  - UniPCMultistepScheduler — flow-matching, prediction_type='flow_prediction', T=1000
 
-This wrapper exposes a single-step training objective:
-  - encode simulated video x0 (latent)
-  - sample timestep t and noise
-  - construct noisy latent x_t via the Wan schedule
-  - predict flow using Wan low/high-noise expert model
-  - compute MSE between predicted flow and target flow
+SDS objective (rectified-flow / flow-matching):
+    σ = t / T  ∈ [0, 1]
+    x_t = (1 − σ) · x₀ + σ · ε
+    v_target = ε − x₀          (direction from data to noise)
+    L_SDS = ‖v_θ(x_t, t, c) − v_target‖²
 
-For Wan2.2 FlowUniPC schedule with prediction_type='flow_prediction' and
-predict_x0=True, the model output v targets:
-  v = (x_t - x0) / sigma  == noise - x0
-given x_t = (1 - sigma) * x0 + sigma * noise.
+x₀ = VAE.encode(simulated_video) · scaling_factor
+v_θ is the frozen Wan transformer.
+SPSA probes the scalar loss with ±Δφ and estimates ∂L/∂φ numerically.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -37,28 +34,26 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class Wan22I2VConfig:
-    wan_repo_root: Optional[Path]
+    # Local path to a snapshot_download of Wan-AI/Wan2.2-TI2V-5B-Diffusers
     ckpt_dir: Path
 
     device: str = "cuda"
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16  # for transformer; VAE always float32
 
-    # Conditioning
+    # Text conditioning (empty → unconditional baseline works fine for SDS)
     prompt: str = ""
     negative_prompt: str = ""
     use_cfg: bool = False
     cfg_scale: float = 3.5
 
-    # Expert switching
-    boundary: float = 0.900  # same meaning as Wan configs: high-noise if t >= boundary * 1000
-
-    # Schedule
+    # Flow-matching schedule length — must match model (Wan uses 1000)
     num_train_timesteps: int = 1000
 
-    # Conditioning mask
+    # ── Legacy fields kept for backwards-compat with train_sds_physics.py ──────
+    # These are accepted but unused in the diffusers-based implementation.
+    wan_repo_root: Optional[Path] = None
+    boundary: float = 0.900
     use_first_frame_mask: bool = True
-
-    # Tokenizer/model locations
     t5_checkpoint_name: str = "models_t5_umt5-xxl-enc-bf16.pth"
     t5_tokenizer: str = "google/umt5-xxl"
     vae_checkpoint_name: str = "Wan2.1_VAE.pth"
@@ -66,192 +61,248 @@ class Wan22I2VConfig:
     high_noise_subfolder: str = "high_noise_model"
 
 
-def _normalize_video_to_m11(video_01: torch.Tensor) -> torch.Tensor:
-    return video_01 * 2.0 - 1.0
-
-
-def _image_to_tensor01(image: torch.Tensor) -> torch.Tensor:
-    # Accept (3,H,W) or (B,3,H,W); ensure float in [0,1]
-    if image.dtype == torch.uint8:
-        image = image.float() / 255.0
-    return image.clamp(0.0, 1.0)
-
-
 class Wan22I2VGuidance(nn.Module):
     """
-    Computes a Wan2.2 I2V flow-prediction loss from a pixel-space video tensor.
+    Wraps Wan2.2-TI2V-5B (via HuggingFace diffusers) as a frozen SDS prior.
 
-    This class assumes batch size 1 by default for feasibility with large models.
+    All components live on device at all times — no CPU offloading.
+
+    Components:
+      - self.vae         : AutoencoderKLWan (float32)
+      - self.transformer : WanTransformer3DModel (bfloat16, frozen)
+      - self.text_encoder: T5EncoderModel / umt5-xxl (bfloat16, frozen)
+      - self.tokenizer   : T5Tokenizer (max_length=512)
+      - self.scheduler   : UniPCMultistepScheduler (flow_prediction)
+
+    Public API:
+      guidance.compute_loss(video_01, cond_image_01=None, timesteps=None, generator=None)
+        → scalar SDS loss (float32 tensor)
     """
 
     def __init__(self, config: Wan22I2VConfig):
         super().__init__()
-        self.cfg = config
+        self.cfg    = config
         self.device = torch.device(config.device)
-
-        if config.wan_repo_root is not None:
-            wan_root = str(config.wan_repo_root)
-            if wan_root not in sys.path:
-                sys.path.insert(0, wan_root)
+        # Always bfloat16 for transformer (more stable than float16 for Wan)
+        self._dtype = torch.bfloat16
 
         try:
-            from wan.modules.model import WanModel  # type: ignore
-            from wan.modules.t5 import T5EncoderModel  # type: ignore
-            from wan.modules.vae2_1 import Wan2_1_VAE  # type: ignore
-            from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler  # type: ignore
-        except Exception as e:
+            from diffusers import WanPipeline, AutoencoderKLWan  # type: ignore
+        except ImportError as exc:
             raise RuntimeError(
-                "Failed to import Wan2.2 modules. Ensure the Wan2.2 repo is installed or pass --wan-repo-root.\n"
-                "Wan2.2 also requires diffusers/transformers dependencies."
-            ) from e
+                "diffusers is required for Wan 5B guidance.\n"
+                "Install: pip install git+https://github.com/huggingface/diffusers\n"
+                f"Error: {exc}"
+            ) from exc
 
-        self._WanModel = WanModel
-        self._T5EncoderModel = T5EncoderModel
-        self._Wan2_1_VAE = Wan2_1_VAE
-        self._Scheduler = FlowUniPCMultistepScheduler
+        model_path = str(config.ckpt_dir)
+        print(f"[Wan5B] Loading from {model_path} …")
 
-        ckpt_dir = config.ckpt_dir
-        if not ckpt_dir.exists():
-            raise FileNotFoundError(f"Wan checkpoint dir not found: {ckpt_dir}")
+        # VAE in float32 for better encoding quality
+        vae = AutoencoderKLWan.from_pretrained(
+            model_path, subfolder="vae", torch_dtype=torch.float32
+        )
+        # Full pipeline in bfloat16
+        pipe = WanPipeline.from_pretrained(
+            model_path, vae=vae, torch_dtype=self._dtype
+        )
+        pipe = pipe.to(self.device)
+        if hasattr(pipe, "set_progress_bar_config"):
+            pipe.set_progress_bar_config(disable=True)
 
-        # VAE (frozen, but keep autograd for inputs)
-        self.vae = self._Wan2_1_VAE(
-            vae_pth=str(ckpt_dir / config.vae_checkpoint_name),
-            dtype=config.dtype,
-            device=str(self.device),
+        # Extract components and freeze
+        self.vae: nn.Module          = pipe.vae.eval().requires_grad_(False)
+        self.transformer: nn.Module  = pipe.transformer.eval().requires_grad_(False)
+        self.text_encoder: nn.Module = pipe.text_encoder.eval().requires_grad_(False)
+        self.tokenizer               = pipe.tokenizer
+        self.scheduler               = pipe.scheduler
+
+        # Cache scaling_factor — defaults to the Wan value 0.13235
+        self._scaling_factor: float = float(
+            getattr(getattr(self.vae, "config", None), "scaling_factor", None) or 0.13235
         )
 
-        # Denoisers (frozen)
-        self.low_noise_model = self._WanModel.from_pretrained(str(ckpt_dir), subfolder=config.low_noise_subfolder)
-        self.high_noise_model = self._WanModel.from_pretrained(str(ckpt_dir), subfolder=config.high_noise_subfolder)
-        self.low_noise_model.eval().requires_grad_(False).to(self.device)
-        self.high_noise_model.eval().requires_grad_(False).to(self.device)
-
-        # Scheduler (training schedule)
-        self.scheduler = self._Scheduler(
-            num_train_timesteps=config.num_train_timesteps,
-            prediction_type="flow_prediction",
-            shift=1.0,
-            use_dynamic_shifting=False,
-            predict_x0=True,
-        )
-
-        # Text encoder embeddings (precomputed; they do not depend on the simulation)
-        t5_checkpoint_path = ckpt_dir / config.t5_checkpoint_name
-        self.text_encoder = self._T5EncoderModel(
-            text_len=512,
-            dtype=torch.bfloat16 if config.dtype == torch.bfloat16 else torch.float16,
-            device=torch.device("cpu"),
-            checkpoint_path=str(t5_checkpoint_path),
-            tokenizer_path=config.t5_tokenizer,
-            shard_fn=None,
-        )
-        self.text_encoder.model.eval().requires_grad_(False)
-
+        # Pre-encode text prompts (constant across training)
         with torch.no_grad():
-            # The Wan API returns a list[Tensor] (one per prompt in batch)
-            self._context = self.text_encoder([config.prompt], torch.device("cpu"))[0].to(self.device)
-            if config.negative_prompt:
-                self._context_null = self.text_encoder([config.negative_prompt], torch.device("cpu"))[0].to(self.device)
-            else:
-                self._context_null = self.text_encoder([""], torch.device("cpu"))[0].to(self.device)
+            self._context      = self._encode_text(config.prompt)
+            self._context_null = self._encode_text(config.negative_prompt or "")
+
+        del pipe  # pipeline shell no longer needed; components stored in self.*
+        print(
+            f"[Wan5B] Ready — transformer=bfloat16, vae=float32, "
+            f"scaling_factor={self._scaling_factor}, device={self.device}"
+        )
+
+    # ── Properties ────────────────────────────────────────────────────────────
 
     @property
     def num_train_timesteps(self) -> int:
-        return int(self.cfg.num_train_timesteps)
+        return int(getattr(self.scheduler.config, "num_train_timesteps", 1000))
 
-    def _build_mask(self, latent_shape: Tuple[int, int, int, int]) -> torch.Tensor:
-        # latent shape: (C, T, H, W); mask is 4 channels as used in Wan2.2 I2V y-conditioning.
-        _, t, h, w = latent_shape
-        mask = torch.zeros(4, t, h, w, device=self.device, dtype=torch.float32)
-        mask[:, 0] = 1.0
-        return mask
+    # ── Text encoding ─────────────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def _encode_cond_latent(self, cond_image_01: torch.Tensor, video_hw: Tuple[int, int], video_len: int) -> torch.Tensor:
-        # Build a conditional video with the image as the first frame and zeros afterwards.
-        h, w = video_hw
-        img = _image_to_tensor01(cond_image_01).to(device=self.device, dtype=torch.float32)
-        if img.ndim == 3:
-            img = img.unsqueeze(0)
-        img = F.interpolate(img, size=(h, w), mode="bilinear", align_corners=False)
-        img_m11 = _normalize_video_to_m11(img)
+    def _encode_text(self, text: str) -> torch.Tensor:
+        """
+        Tokenise + encode text → (1, seq_len, 4096) bfloat16.
 
-        video = torch.zeros(1, 3, video_len, h, w, device=self.device, dtype=torch.float32)
-        video[:, :, 0] = img_m11[:, :, 0]
-        video = video.squeeze(0)  # (3, T, H, W)
+        Passes attention_mask so padding tokens are not attended to.
+        """
+        max_len = int(getattr(self.tokenizer, "model_max_length", 512))
+        tokens = self.tokenizer(
+            [text],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+        )
+        input_ids      = tokens.input_ids.to(self.device)
+        attention_mask = tokens.attention_mask.to(self.device)
 
-        y_lat = self.vae.encode([video])[0]  # (C_lat, T', H', W')
-        mask = self._build_mask(tuple(y_lat.shape))
-        return torch.cat([mask, y_lat], dim=0)
+        out = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        return out.last_hidden_state.to(self._dtype)   # (1, seq_len, 4096)
 
-    def _choose_model(self, t: torch.Tensor) -> nn.Module:
-        threshold = self.cfg.boundary * float(self.cfg.num_train_timesteps)
-        return self.high_noise_model if float(t.item()) >= threshold else self.low_noise_model
+    # ── VAE helpers ───────────────────────────────────────────────────────────
+
+    def _vae_encode(
+        self,
+        video_m11: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """
+        Encode video [-1, 1] → scaled latents.
+
+        video_m11: (B, 3, T, H, W) float32 in [-1, 1]
+        Returns:   (B, 16, T/4, H/8, W/8) float32, scaled by scaling_factor
+        """
+        posterior = self.vae.encode(video_m11)
+        latent_dist = posterior.latent_dist
+
+        # DiagonalGaussianDistribution.sample() signature varies across
+        # diffusers versions — handle both with and without generator arg.
+        try:
+            x0 = latent_dist.sample(generator=generator)
+        except TypeError:
+            # Fallback: set manual seed on torch global RNG if generator given
+            if generator is not None:
+                torch.manual_seed(generator.initial_seed())
+            x0 = latent_dist.sample()
+
+        return x0 * self._scaling_factor
+
+    # ── Transformer forward ───────────────────────────────────────────────────
+
+    def _denoise(
+        self,
+        x_t: torch.Tensor,
+        timesteps: torch.LongTensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Single frozen transformer forward pass.
+
+        x_t       : (B, 16, T', H', W') bfloat16 — noisy latents
+        timesteps : (B,) long
+        context   : (B, seq_len, 4096) bfloat16 — text embeddings
+
+        Returns:  (B, 16, T', H', W') float32 — predicted flow
+        """
+        # return_dict=False → returns tuple; [0] is the output tensor.
+        # This avoids any potential Transformer2DModelOutput attribute issues.
+        with torch.no_grad():
+            out = self.transformer(
+                hidden_states=x_t,
+                timestep=timesteps,
+                encoder_hidden_states=context,
+                return_dict=False,
+            )
+        pred = out[0]  # (B, 16, T', H', W') bfloat16
+
+        # Optional classifier-free guidance
+        if self.cfg.use_cfg:
+            context_null = self._context_null.expand(x_t.shape[0], -1, -1)
+            with torch.no_grad():
+                out_uncond = self.transformer(
+                    hidden_states=x_t,
+                    timestep=timesteps,
+                    encoder_hidden_states=context_null,
+                    return_dict=False,
+                )
+            pred_uncond = out_uncond[0]
+            pred = pred_uncond + float(self.cfg.cfg_scale) * (pred - pred_uncond)
+
+        return pred.float()
+
+    # ── SDS loss ──────────────────────────────────────────────────────────────
 
     def compute_loss(
         self,
         video_01: torch.Tensor,
-        cond_image_01: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None,
+        cond_image_01: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.LongTensor] = None,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """
+        One-step rectified-flow SDS loss.
+
         Args:
-            video_01: (B, 3, T, H, W) in [0, 1]
-            cond_image_01: (3, H, W) or (B, 3, H, W) in [0, 1]
-            timesteps: optional (B,) timesteps in [0, num_train_timesteps)
+            video_01      : (B, 3, T, H, W) float32 in [0, 1] — simulated video
+            cond_image_01 : (3, H, W) or (B, 3, H, W) — optional first-frame
+                            conditioning image (accepted for API compat; the 5B
+                            model is used in T2V mode so this is currently unused)
+            timesteps     : (B,) long in [0, num_train_timesteps).
+                            Sampled uniformly at random if None.
+            generator     : torch.Generator for reproducible noise across SPSA
+                            ± perturbations.  Pass the same generator (reset to
+                            the same seed) for every probe in one SPSA step.
+
+        Returns:
+            Scalar SDS loss tensor (float32).
+            For SPSA, detach() is not needed — the caller wraps in no_grad().
         """
         if video_01.ndim != 5 or video_01.shape[1] != 3:
-            raise ValueError("video_01 must be (B, 3, T, H, W)")
-        b, _, t_frames, h, w = video_01.shape
-        if b != 1:
-            raise ValueError("Wan22I2VGuidance currently supports batch_size=1 (due to model size and per-step expert selection).")
+            raise ValueError(
+                f"video_01 must be (B, 3, T, H, W), got shape {tuple(video_01.shape)}"
+            )
+        b, _, T_frames, H, W = video_01.shape
+        # Wan VAE compresses temporal ×4 — need at least 4 frames for 1 latent frame
+        if T_frames < 4:
+            raise ValueError(
+                f"video_01 has only {T_frames} frames. "
+                "Wan VAE requires ≥4 frames (temporal compression ×4). "
+                "Set TRAIN_FRAME_NUM ≥ 16 in your config."
+            )
 
+        # ── 1. Encode video to scaled latents ────────────────────────────────
+        video_m11 = (video_01 * 2.0 - 1.0).to(device=self.device, dtype=torch.float32)  # [-1, 1]
+        x0 = self._vae_encode(video_m11, generator=generator)
+        # x0: (B, 16, T/4, H/8, W/8) float32
+
+        # ── 2. Sample diffusion timestep ─────────────────────────────────────
         if timesteps is None:
             timesteps = torch.randint(
-                0, self.cfg.num_train_timesteps, (b,),
+                0, self.num_train_timesteps, (b,),
                 generator=generator, device=self.device,
             ).long()
-        t_scalar = timesteps[0].float()
+        timesteps = timesteps.to(self.device)
 
-        # Encode x0 with gradients (depends on simulated video).
-        video_m11 = _normalize_video_to_m11(video_01.to(device=self.device, dtype=torch.float32))
-        x0 = self.vae.encode([video_m11[0]])[0]  # (C_lat, T', H', W')
-
-        # Conditioning y is constant wrt simulation, so compute without grads.
-        y = self._encode_cond_latent(cond_image_01, (h, w), t_frames)
-
-        # Noise schedule: sigma in [0, 1]. Use a simple mapping consistent with Wan timesteps.
-        sigma = (t_scalar / float(self.cfg.num_train_timesteps)).clamp(0.0, 1.0)
+        # ── 3. Rectified-flow noising ─────────────────────────────────────────
+        #   x_t = (1 − σ) x₀ + σ ε,    σ = t / T ∈ [0, 1]
         noise = torch.randn_like(x0, generator=generator)
+        sigma = (timesteps.float() / float(self.num_train_timesteps))
+        # Reshape for broadcasting: (B,) → (B, 1, 1, 1, 1)
+        sigma = sigma.view(b, 1, 1, 1, 1)
         x_t = (1.0 - sigma) * x0 + sigma * noise
 
-        # Target flow for flow_prediction + predict_x0: v = (x_t - x0)/sigma = noise - x0
-        target_flow = noise - x0
+        # Target flow: model should predict direction from x₀ to noise
+        target = noise - x0  # (B, 16, T', H', W') float32
 
-        model = self._choose_model(t_scalar)
+        # ── 4. Frozen denoiser forward ────────────────────────────────────────
+        context = self._context.expand(b, -1, -1)  # (B, 512, 4096) bfloat16
+        pred = self._denoise(x_t.to(self._dtype), timesteps, context)
+        # pred: (B, 16, T', H', W') float32
 
-        # WanModel.forward expects lists.
-        x_list = [x_t]
-        y_list = [y]
-        context_list = [self._context]
-        seq_len = int((x0.shape[1] * (x0.shape[2] // 2) * (x0.shape[3] // 2)))
-        t_tensor = t_scalar.view(1).to(device=self.device, dtype=torch.float32)
-
-        pred_cond = model(x_list, t=t_tensor, context=context_list, seq_len=seq_len, y=y_list)[0]
-
-        if self.cfg.use_cfg:
-            pred_uncond = model(
-                x_list,
-                t=t_tensor,
-                context=[self._context_null],
-                seq_len=seq_len,
-                y=y_list,
-            )[0]
-            pred = pred_uncond + float(self.cfg.cfg_scale) * (pred_cond - pred_uncond)
-        else:
-            pred = pred_cond
-
-        return F.mse_loss(pred, target_flow, reduction="mean")
-
+        # ── 5. MSE flow loss ──────────────────────────────────────────────────
+        return F.mse_loss(pred, target, reduction="mean")

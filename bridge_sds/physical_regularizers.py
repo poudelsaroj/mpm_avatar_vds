@@ -49,7 +49,7 @@ def penetration_loss(
         Scalar loss tensor.
     """
     if not cloth_verts_seq:
-        return torch.tensor(0.0)
+        return torch.zeros(1, device="cuda" if torch.cuda.is_available() else "cpu").squeeze()
 
     device = cloth_verts_seq[0].device
     total  = torch.zeros(1, device=device)
@@ -97,7 +97,7 @@ def stretch_loss(
         Scalar loss tensor.
     """
     if not cloth_verts_seq:
-        return torch.tensor(0.0)
+        return torch.zeros(1, device="cuda" if torch.cuda.is_available() else "cpu").squeeze()
 
     device = cloth_verts_seq[0].device
     rest   = rest_verts.to(device)
@@ -152,7 +152,7 @@ def temporal_smooth_loss(
         Scalar loss tensor.
     """
     if len(cloth_vels_seq) < 2:
-        return torch.tensor(0.0)
+        return torch.zeros(1, device="cuda" if torch.cuda.is_available() else "cpu").squeeze()
 
     device = cloth_vels_seq[0].device
     total  = torch.zeros(1, device=device)

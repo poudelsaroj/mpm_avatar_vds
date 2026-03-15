@@ -72,17 +72,20 @@ def from_torch_safe(t, dtype=None, requires_grad=None, grad=None):
             t.grad = torch.zeros_like(t, requires_grad=False)
         grad = from_torch(t.grad, dtype=dtype)
 
-    a = wp.types.array(
+    kwargs = dict(
         ptr=t.data_ptr(),
         dtype=dtype,
         shape=shape,
         strides=strides,
         device=device_from_torch(t.device),
         copy=False,
-        owner=False,
         grad=grad,
         requires_grad=requires_grad,
     )
+    import inspect
+    if "owner" in inspect.signature(wp.types.array.__init__).parameters:
+        kwargs["owner"] = False
+    a = wp.types.array(**kwargs)
 
     # save a reference to the source tensor, otherwise it will be deallocated
     a._tensor = t

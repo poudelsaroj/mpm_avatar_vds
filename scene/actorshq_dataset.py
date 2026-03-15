@@ -113,8 +113,14 @@ class ActorsHQDataset(Dataset):
                 rgb_path = os.path.join(self.image_path, f"rgbs/{camera_id}/{camera_id}_rgb{frame:06d}.jpg")
                 msk_path = os.path.join(self.image_path, f"masks/{camera_id}/{camera_id}_mask{frame:06d}.png")
                 
-                rgb_numpy = np.array(Image.open(rgb_path).resize((W, H), Image.BILINEAR))
-                msk_numpy = np.array(Image.open(msk_path).resize((W, H), Image.BILINEAR))
+                if os.path.exists(rgb_path):
+                    rgb_numpy = np.array(Image.open(rgb_path).resize((W, H), Image.BILINEAR))
+                else:
+                    rgb_numpy = np.zeros((H, W, 3), dtype=np.uint8)
+                if os.path.exists(msk_path):
+                    msk_numpy = np.array(Image.open(msk_path).resize((W, H), Image.BILINEAR))
+                else:
+                    msk_numpy = np.ones((H, W), dtype=np.uint8) * 255
 
                 rgb_numpy_list.append(rgb_numpy)
                 msk_numpy_list.append(msk_numpy)

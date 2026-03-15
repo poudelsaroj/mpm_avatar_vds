@@ -506,12 +506,12 @@ def p2g_apic_with_stress(state: MPMStateStruct, model: MPMModelStruct, dt: float
         wa = wp.vec3(1.5) - fx
         wb = fx - wp.vec3(1.0)
         wc = fx - wp.vec3(0.5)
-        w = wp.mat33(
+        w = wp.matrix_from_rows(
             wp.cw_mul(wa, wa) * 0.5,
             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
             wp.cw_mul(wc, wc) * 0.5,
         )
-        dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+        dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
 
         for i in range(0, 3):
             for j in range(0, 3):
@@ -591,7 +591,7 @@ def grid_normalization_and_gravity(
 #             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
 #             wp.cw_mul(wc, wc) * 0.5,
 #         )
-#         dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+#         dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
 #         new_v = wp.vec3(0.0, 0.0, 0.0)
 #         new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 #         new_F = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -658,10 +658,10 @@ def grid_normalization_and_gravity(
 #             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
 #             wp.cw_mul(wc, wc) * 0.5,
 #         )
-#         dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+#         dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
 #         new_v = wp.vec3(0.0, 0.0, 0.0)
 #         # new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-#         new_C = wp.mat33(new_v, new_v, new_v)
+#         new_C = wp.matrix_from_rows(new_v, new_v, new_v)
         
 #         new_F = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
@@ -705,7 +705,7 @@ def grid_normalization_and_gravity(
 #         I33_1 = wp.vec3(1.0, 0.0, 0.0)
 #         I33_2 = wp.vec3(0.0, 1.0, 0.0)
 #         I33_3 = wp.vec3(0.0, 0.0, 1.0)
-#         I33 = wp.mat33(I33_1, I33_2, I33_3)
+#         I33 = wp.matrix_from_cols(I33_1, I33_2, I33_3)
 #         F_tmp = (I33 + new_F * dt) * state.particle_F[p]
 #         next_state.particle_F_trial[p] = F_tmp
 
@@ -733,15 +733,15 @@ def g2p_v(
         wa = wp.vec3(1.5) - fx
         wb = fx - wp.vec3(1.0)
         wc = fx - wp.vec3(0.5)
-        w = wp.mat33(
+        w = wp.matrix_from_rows(
             wp.cw_mul(wa, wa) * 0.5,
             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
             wp.cw_mul(wc, wc) * 0.5,
         )
-        dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+        dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
         new_v = wp.vec3(0.0, 0.0, 0.0)
         # new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        new_C = wp.mat33(new_v, new_v, new_v)
+        new_C = wp.matrix_from_rows(new_v, new_v, new_v)
         new_F = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         for i in range(0, 3):
@@ -805,15 +805,15 @@ def g2p_e(
         wa = wp.vec3(1.5) - fx
         wb = fx - wp.vec3(1.0)
         wc = fx - wp.vec3(0.5)
-        w = wp.mat33(
+        w = wp.matrix_from_rows(
             wp.cw_mul(wa, wa) * 0.5,
             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
             wp.cw_mul(wc, wc) * 0.5,
         )
-        dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+        dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
         new_v = wp.vec3(0.0, 0.0, 0.0)
         # new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        new_C = wp.mat33(new_v, new_v, new_v)
+        new_C = wp.matrix_from_rows(new_v, new_v, new_v)
         
         new_F = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
@@ -851,7 +851,7 @@ def g2p_e(
         I33_1 = wp.vec3(1.0, 0.0, 0.0)
         I33_2 = wp.vec3(0.0, 1.0, 0.0)
         I33_3 = wp.vec3(0.0, 0.0, 1.0)
-        I33 = wp.mat33(I33_1, I33_2, I33_3)
+        I33 = wp.matrix_from_cols(I33_1, I33_2, I33_3)
         d3_tmp = (I33 + new_F * dt) * d3
         new_d = wp.mat33(d1[0], d2[0], d3_tmp[0], d1[1], d2[1], d3_tmp[1], d1[2], d2[2], d3_tmp[2])
         state.particle_d[p] = new_d
@@ -876,14 +876,14 @@ def g2p_v_differentiable(
         wa = wp.vec3(1.5) - fx
         wb = fx - wp.vec3(1.0)
         wc = fx - wp.vec3(0.5)
-        w = wp.mat33(
+        w = wp.matrix_from_rows(
             wp.cw_mul(wa, wa) * 0.5,
             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
             wp.cw_mul(wc, wc) * 0.5,
         )
         new_v = wp.vec3(0.0, 0.0, 0.0)
         # new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        new_C = wp.mat33(new_v, new_v, new_v)
+        new_C = wp.matrix_from_rows(new_v, new_v, new_v)
 
         for i in range(0, 3):
             for j in range(0, 3):
@@ -941,15 +941,15 @@ def g2p_e_differentiable(
         wa = wp.vec3(1.5) - fx
         wb = fx - wp.vec3(1.0)
         wc = fx - wp.vec3(0.5)
-        w = wp.mat33(
+        w = wp.matrix_from_rows(
             wp.cw_mul(wa, wa) * 0.5,
             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
             wp.cw_mul(wc, wc) * 0.5,
         )
-        dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+        dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
         new_v = wp.vec3(0.0, 0.0, 0.0)
         # new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        new_C = wp.mat33(new_v, new_v, new_v)
+        new_C = wp.matrix_from_rows(new_v, new_v, new_v)
         
         new_F = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
@@ -987,7 +987,7 @@ def g2p_e_differentiable(
         I33_1 = wp.vec3(1.0, 0.0, 0.0)
         I33_2 = wp.vec3(0.0, 1.0, 0.0)
         I33_3 = wp.vec3(0.0, 0.0, 1.0)
-        I33 = wp.mat33(I33_1, I33_2, I33_3)
+        I33 = wp.matrix_from_cols(I33_1, I33_2, I33_3)
         d3_tmp = (I33 + new_F * dt) * d3
         new_d = wp.mat33(d1[0], d2[0], d3_tmp[0], d1[1], d2[1], d3_tmp[1], d1[2], d2[2], d3_tmp[2])
         next_state.particle_d[p] = new_d
@@ -1289,7 +1289,7 @@ def set_F_C_p2g(
         wa = wp.vec3(1.5) - fx
         wb = fx - wp.vec3(1.0)
         wc = fx - wp.vec3(0.5)
-        w = wp.mat33(
+        w = wp.matrix_from_rows(
             wp.cw_mul(wa, wa) * 0.5,
             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
             wp.cw_mul(wc, wc) * 0.5,
@@ -1329,7 +1329,7 @@ def set_F_C_p2g(
 #             wp.vec3(0.0, 0.0, 0.0) - wp.cw_mul(wb, wb) + wp.vec3(0.75),
 #             wp.cw_mul(wc, wc) * 0.5,
 #         )
-#         dw = wp.mat33(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
+#         dw = wp.matrix_from_rows(fx - wp.vec3(1.5), -2.0 * (fx - wp.vec3(1.0)), fx - wp.vec3(0.5))
 #         new_C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 #         new_F = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
