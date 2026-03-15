@@ -124,25 +124,29 @@ class Wan22I2VGuidance(nn.Module):
             getattr(getattr(self.vae, "config", None), "scaling_factor", None) or 0.13235
         )
 
-        # ── Text encoder: load to CPU, move to GPU briefly, then delete ───────
-        # T5 is ~9.4 GB.  Loading it after transformer+VAE are already on GPU
-        # would peak at ~21 GB — just within the L4's 22.3 GB limit.
-        print("[Wan5B]   loading text_encoder (CPU) …")
+        # ── Text encoder: CPU-only encoding (T5 never goes to GPU) ──────────────
+        # transformer+VAE+MPM+Gaussians already fill the L4's 22 GB.
+        # T5 (9.4 GB) is only needed once — run it on CPU in float32, then
+        # cast the embeddings to bfloat16 and move to GPU.
+        print("[Wan5B]   loading text_encoder on CPU …")
         tokenizer    = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            model_path, subfolder="text_encoder", torch_dtype=self._dtype
-        )  # starts on CPU
+            model_path, subfolder="text_encoder", torch_dtype=torch.float32
+        ).eval().requires_grad_(False)  # stays on CPU
 
-        # Move T5 to GPU only for encoding, then immediately delete
-        print("[Wan5B]   encoding prompts (T5 on GPU briefly) …")
+        print("[Wan5B]   encoding prompts on CPU …")
         self.tokenizer    = tokenizer
-        self.text_encoder = text_encoder.to(self.device).eval().requires_grad_(False)
+        self.text_encoder = text_encoder          # temporarily store for _encode_text
 
         with torch.no_grad():
             self._context      = self._encode_text(config.prompt)
             self._context_null = self._encode_text(config.negative_prompt or "")
 
-        # Free T5 + tokenizer — reclaims ~9.4 GB, leaving only transformer + VAE
+        # Move embeddings to GPU
+        self._context      = self._context.to(self.device)
+        self._context_null = self._context_null.to(self.device)
+
+        # Free T5 + tokenizer — they are no longer needed
         del self.text_encoder
         del self.tokenizer
         del text_encoder
@@ -178,8 +182,10 @@ class Wan22I2VGuidance(nn.Module):
             truncation=True,
             max_length=max_len,
         )
-        input_ids      = tokens.input_ids.to(self.device)
-        attention_mask = tokens.attention_mask.to(self.device)
+        # Run on whichever device text_encoder lives on (CPU during init, GPU if called later)
+        enc_device     = next(self.text_encoder.parameters()).device
+        input_ids      = tokens.input_ids.to(enc_device)
+        attention_mask = tokens.attention_mask.to(enc_device)
 
         out = self.text_encoder(
             input_ids=input_ids,
