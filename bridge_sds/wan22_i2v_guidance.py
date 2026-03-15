@@ -174,7 +174,7 @@ class Wan22I2VGuidance(nn.Module):
 
         Passes attention_mask so padding tokens are not attended to.
         """
-        max_len = int(getattr(self.tokenizer, "model_max_length", 512))
+        max_len = min(int(getattr(self.tokenizer, "model_max_length", 512)), 512)
         tokens = self.tokenizer(
             [text],
             return_tensors="pt",
