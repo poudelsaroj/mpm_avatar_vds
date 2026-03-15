@@ -737,11 +737,13 @@ class SDSPhysicsTrainer(Trainer):
             video_every = int(
                 self.sds_cfg.get("training", {}).get("video_every", 5)
             )
-            if (self.step % video_every == 0) and base_video is not None:
-                # base_video: [1, 3, T, H, W] → [T, 3, H, W] for wandb
-                v = base_video[0].permute(1, 0, 2, 3)
-                v_np = (v.clamp(0, 1).numpy() * 255).astype(np.uint8)
-                wd["video/sim_cloth"] = wandb.Video(v_np, fps=25, format="gif")
+            if (self.step > 0 and self.step % video_every == 0) and base_video is not None:
+                # base_video: log first, middle, last frame as images (no moviepy needed)
+                v = base_video[0].permute(1, 0, 2, 3)  # [T, 3, H, W]
+                T_v = v.shape[0]
+                for fi, frame_idx in enumerate([0, T_v // 2, T_v - 1]):
+                    f_np = (v[frame_idx].clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    wd[f"video/frame_{fi}"] = wandb.Image(f_np, caption=f"frame {frame_idx}")
 
                 # Multi-camera snapshots: uniformly spaced across pool
                 n_preview = min(4, len(self._cameras))
