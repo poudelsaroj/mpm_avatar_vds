@@ -11,22 +11,24 @@
 
 # ── Physics parameter search space ───────────────────────────────────────────
 phi:
-  D:                            # Cloth density (kg/m^3)
-    init:  0.3                  # lighter than default 1.0
-    min:   0.1
-    max:   3.0
-  E:                            # Young's modulus (stored ×100 in MPMAvatar)
-    init:  50.0                 # less stiff than default 100 Pa
-    min:   0.5
-    max:   20.0
-  H:                            # Height / initial-cloth-scale factor
-    init:  0.95                 # slightly different from default 1.0
-    min:   0.8
-    max:   1.2
-  friction:                     # Body-cloth friction coefficient (NEW param)
-    init:  0.3                  # lower than default 0.5 — hypothesis: friction matters
-    min:   0.01
-    max:   1.0
+  # Ranges set to ±200% of known physical optimum (max = 3× optimal).
+  # Prevents wild initialisation (e.g. E=1400Pa) while still testing convergence.
+  D:                            # Cloth density (kg/m^3), optimal ≈ 0.3
+    init:  0.3
+    min:   0.05                 # 0.3 / 6  (lower bound ~1/6 of optimal)
+    max:   0.9                  # 0.3 × 3  (3× optimal)
+  E:                            # Young's modulus stored ×100; optimal ≈ 50 Pa → stored 0.5
+    init:  50.0
+    min:   0.1                  # 10 Pa  (~1/5 of optimal)
+    max:   1.5                  # 150 Pa (3× optimal)
+  H:                            # Height scale, optimal ≈ 1.0
+    init:  0.95
+    min:   0.5                  # 0.5× optimal
+    max:   2.0                  # 2× optimal (capped — beyond 2 cloth explodes)
+  friction:                     # Body-cloth friction, optimal ≈ 0.3
+    init:  0.3
+    min:   0.05                 # ~1/6 of optimal
+    max:   0.9                  # 3× optimal
 
 # ── Fixed MPM material parameters ────────────────────────────────────────────
 mpm_fixed:
